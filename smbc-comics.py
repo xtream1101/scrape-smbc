@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import cutil
@@ -5,8 +6,10 @@ import signal
 import logging
 from pprint import pprint
 from scraper_monitor import scraper_monitor
-from models import db_session, Setting, Comic, NoResultFound
-from scraper_lib import Scraper, Web
+from models import db_session, Setting, Comic, NoResultFound, DBSession
+from scraper_lib import Scraper
+from web_wrapper import DriverRequests
+
 
 # Create logger for this script
 logger = logging.getLogger(__name__)
@@ -14,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class Worker:
 
-    def __init__(self, web, comic_id):
+    def __init__(self, scraper, web, comic_id):
         """
         Worker Profile
 
@@ -24,8 +27,7 @@ class Worker:
         # `web` is what utilizes the profiles and proxying
         self.web = web
         self.comic_id = comic_id
-
-        # print(self.ref_data['posted_at'], " | ", self.ref_data['posted_at'].month)
+        self.scraper = scraper
 
         # Get the sites content as a beautifulsoup object
         logger.info("Getting comic {id}".format(id=self.comic_id))
@@ -38,13 +40,13 @@ class Worker:
             parsed_data = self.parse(response)
             if len(parsed_data) > 0:
                 # Add raw data to db
-                self.web.scraper.insert_data(parsed_data)
+                self.scraper.insert_data(parsed_data)
 
                 # Remove id from list of comics to get
-                self.web.scraper.comic_ids.remove(self.comic_id)
+                self.scraper.comic_ids.remove(self.comic_id)
 
                 # Add success count to stats. Keeps track of how much ref data has been parsed
-                self.web.scraper.track_stat('ref_data_success_count', 1)
+                self.scraper.track_stat('ref_data_success_count', 1)
 
         # Take it easy on the site
         time.sleep(1)
@@ -54,19 +56,21 @@ class Worker:
         :return: List of items with their details
         """
         # Adds title
-        rdata = self.web.scraper.archive_list.get(self.comic_id)
+        rdata = self.scraper.archive_list.get(self.comic_id)
 
         # Parse the items here and return the content to be added to the db
         comic_raw = soup.find(id='cc-comic')
         img_src = comic_raw['src']
 
-        comic_filename = '{year}/{month}/{name}{ext}'\
-                         .format(year=rdata['posted_at'].year,
+        comic_filename = '{base}/{year}/{month}/{name}{ext}'\
+                         .format(base=self.scraper.BASE_SAVE_DIR,
+                                 year=rdata['posted_at'].year,
                                  month=rdata['posted_at'].month,
                                  name=str(rdata['posted_at']),
                                  ext=cutil.get_file_ext(img_src))
         rdata.update({'time_collected': cutil.get_datetime(),
-                      'file_path': self.web.download(img_src, comic_filename),
+                      'file_path': self.web.download(img_src, comic_filename)
+                                           .replace(self.scraper.BASE_DATA_DIR + os.path.sep, ''),
                       'alt': comic_raw['title']
                       })
 
@@ -96,7 +100,7 @@ class SMBCComics(Scraper):
         self.stats['ref_data_count'] = len(self.comic_ids)
 
         # Only ever use 1 thread here
-        self.thread_profile(1, 'requests', self.comic_ids, Worker)
+        self.thread_profile(1, DriverRequests, self.comic_ids, Worker)
 
     def load_archive_list(self):
         """
@@ -104,13 +108,13 @@ class SMBCComics(Scraper):
         Need to do this since this is the only place where the date posted is listed
         """
         rdata = {}
-        tmp_web = Web(self, 'requests')
+        tmp_web = DriverRequests()
 
         url = "http://www.smbc-comics.com/comic/archive"
         try:
             soup = tmp_web.get_site(url, page_format='html')
 
-        except RequestsError as e:
+        except Exception:
             logger.critical("Problem getting comic archive", exc_info=True)
             sys.exit(1)
 
@@ -165,6 +169,7 @@ class SMBCComics(Scraper):
         Will handle inserting data into the database
         """
         try:
+            db_session = DBSession()
             # Check if comic is in database, if so update else create
             try:
                 comic = db_session.query(Comic).filter(Comic.comic_id == data.get('comic_id')).one()
